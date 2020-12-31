@@ -1,0 +1,1363 @@
+---
+title: "Alternative dose allocation strategies to increase benefits from constrained COVID-19 vaccine supply"
+author: 'Ashleigh R Tuite, Lin Zhu, David N Fisman, Joshua A Salomon'
+date: '`r format(Sys.Date(), "%d-%b-%Y")`'
+output:
+  pdf_document: 
+    fig_caption: yes
+    includes:
+      in_header: header.tex
+  html_document:
+    keep_md: yes
+urlcolor: blue
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(knitr.kable.NA = '')
+
+library(tidyverse)
+library(patchwork)
+library(bezier)
+library(here)
+library(knitr)
+library(kableExtra)
+
+source(here("vac_sim_functions.R"))
+```
+
+## Overview
+
+How can vaccine supply be allocated in order to balance availability of timely second doses with the urgent need to supply partially protective first doses to as many people as possible?
+
+The answer to this question likely depends on the following factors:
+
+- Vaccine supply over time: does it increase, remain flat, or decline (due to supply chain/distribution issues)
+- Infection rates: are infection rates rising, stable, or declining?
+- Protection with one dose: data from the Pfizer and Moderna trials indicate that there is partial protection against COVID-19 disease with a single dose of vaccine but the trial was not designed to evaluate the efficacy of a single dose, and the time course of protection is uncertain.
+
+
+
+```{r, echo=FALSE}
+# Specification of initial model parameters
+params_default <- list(
+   weeks_tot = 8, #weeks of vaccination
+   pop_size = 1000,  #population size
+   rel_protect_1_dose = 0.524/0.948, #relative protection associated with single dose (compared to 2 doses)
+   dose_gap = 3, # delay between doses (weeks)
+   steps = 2, # number of steps in vaccine supply function
+   start_weekly_doses = 6/300, #starting proportion of population vaccinated per week (used in step function) - 6 million doses/300 million pop
+   end_weekly_doses = 6/300, #proportion of population vaccinated per week by end of time period (used in the step function)
+   pop_scalar = 300, # 
+   scheme = "switch", #fixed: set aside 50% of vaccines for 2nd dose; switch: set aside less vaccine for 1st 4 weeks, save more after week 4
+   start_pct_saved_switch = 0.1, #proportion of doses set aside for second dose at start 
+   start_pct_saved_fixed = 0.5, # proportion of doses set aside for second dose: 0.5 -> save a dose for all vaccinated, <0.5 -> use extra doses for 1st dose in others
+   switch_week = 4, #week when switch vaccination strategy
+   delay = 0, # delay (in weeks) from receipt of first vaccine dose to development of immunity; set to 0 if using Pfizer-NEJM estimate which includes all time from receipt of dose in estimate
+   waning_scalar = 0.90, # weekly reduction in protection for those who receive only 1 dose 
+   rr_0 = 1, # relative risk of infection at start
+   rr_1 = 1, # relative risk of infection at week 1/3*weeks_tot
+   rr_2 = 1, # relative risk of infection at week 2/3*weeks_tot
+   rr_3 = 1, # relative risk of infection at week 3/3*weeks_tot
+   base_inc = 0.01, #weekly incidence at baseline (when rr=1)
+   ve = 0.948, # vaccine efficacy with 2 doses
+   rr_curve_num = 1 # shape of incidence curve
+   )
+
+params <- params_default
+
+param_dat <- data.frame(value=unlist(params_default)) 
+param_dat$name <- row.names(param_dat)
+
+param_dat %>%
+   filter(name %in% c("weeks_tot","start_weekly_doses", "ve","rel_protect_1_dose", "dose_gap",  "delay", "waning_scalar", "base_inc" )) %>%
+   mutate(value=ifelse(name=="rel_protect_1_dose", params_default$rel_protect_1_dose*params_default$ve, 
+                      ifelse(name=="start_weekly_doses", params_default$start_weekly_doses*params_default$pop_scalar, value)), 
+          name=factor(name, levels=c("weeks_tot", "start_weekly_doses", "dose_gap", "ve", "rel_protect_1_dose", "delay", "waning_scalar", "base_inc"), labels=c("Model time horizon (weeks)", "Initial number of vaccine doses (millions)", "Minimum delay between doses (weeks)", "Vaccine efficacy (2 doses)", "Vaccine efficacy (1 dose)", "Delay from first vaccine to development of protection (weeks)", "Waning factor if 2nd dose is delayed (per week)", "Weekly incidence at model start (%)" ))) %>%
+   rename("Parameter" = name, 
+          Value = value
+          ) %>%
+   arrange(Parameter) %>%
+   select(Parameter, Value) %>%
+kable("latex", booktabs = T,
+caption = "Key model input parameters") 
+   
+
+```
+
+## Vaccine availability
+
+Availability of vaccine is assumed to follow a step function. A vaccine availability function representing a drop in supply at week 4 is shown below: 
+
+```{r, echo=FALSE}
+params$start_weekly_doses <- 0.02*params$pop_scalar #starting proportion of population vaccinated per week (used in step function)
+params$end_weekly_doses <- params$start_weekly_doses/10
+sf_vac <- stepfun(x=params$switch_week, y = seq(params$start_weekly_doses, params$end_weekly_doses, 
+                           length.out=2), right=FALSE)
+vac_df <- sf_vac(seq(1:8))
+plot(vac_df,  type="b", col="red", xlab="Week", ylab="Available vaccine doses")  
+```
+
+## Vaccine allocation
+Allocation of vaccine (i.e., the decision to withhold currently available doses to ensure a second dose is available for those receiving an initial dose) is also modeled using a step function. Here, a value of 0.5 means that a dose is set aside for each person receiving their first dose (the current recommendation). A value of <0.5 means that more doses are being distributed immediately. A value of >0.5 would mean that vaccine is being stockpiled for future use.
+
+We currently evaluating two options: 
+
+1. FIXED: set aside 50% of vaccine supply for 2nd dose
+2. FLEXIBLE: For the first 3 weeks, set aside 10% of vaccine supply for 2nd dose, next 3 weeks, set aside 90% of supply for 2nd dose, remainder of time split doses 50:50
+
+```{r, echo=FALSE}
+sf_allocate_fixed <- rep(params$start_pct_saved_fixed, params$weeks_tot)
+sf_allocate_switch <- c(rep(params$start_pct_saved_switch, params$switch_week-1), rep(1-params$start_pct_saved_switch, params$switch_week-1), rep(params$start_pct_saved_fixed, params$weeks_tot-(params$switch_week-1)*2))
+plot(sf_allocate_switch, type="b", col="red", xlab="Week", ylab="Proportion of doses reserved for 2nd dose")
+lines(sf_allocate_fixed, type="b", col="blue") 
+legend(7, 0.2, legend=c("Flexible", "Fixed"), lty=1, col=c("red", "blue"), cex=0.5)
+```
+
+## Infection risk
+
+Cumulative benefits from vaccines will depend to an extent on the time trend in incidence. We use a flexible function to produce a range of different incidence curves. Manuscript uses two simple examples: flat or increasing and one example of a rising and falling trend, that were defined using a Bezier curve. Some sample trajectories are show below: 
+
+```{r, echo=FALSE}
+#bez1 <- bezier_fun(params)
+param1 <-list(rr_0 = 1, 
+              rr_1 = 1, # relative risk of infection at week 10
+              rr_2 = 1, # relative risk of infection at week 20
+              rr_3 = 1, 
+              weeks_tot=params$weeks_tot)
+bez1 <- bezier_fun(param1) 
+
+param2 <- list(rr_0 = 1, 
+               rr_1 = 1.25, # relative risk of infection at week 10
+               rr_2 = 1.75, # relative risk of infection at week 20
+               rr_3 = 2, 
+               weeks_tot = params$weeks_tot)
+bez2 <-  bezier_fun(param2)
+param3 <- list(rr_0 = 1, 
+               rr_1 = 3, # relative risk of infection at week 10
+               rr_2 = 4, # relative risk of infection at week 20
+               rr_3 = 1, 
+               weeks_tot = params$weeks_tot)
+bez3 <-  bezier_fun(param3)
+
+param4 <- list(rr_0 = params$rr_0, 
+               rr_1 = 0.8, # relative risk of infection at week 10
+               rr_2 = 0.5, # relative risk of infection at week 20
+               rr_3 = 0.25, 
+               weeks_tot = params$weeks_tot)
+bez4 <-  bezier_fun(param4)
+
+
+data.frame(cbind(bez1, bez2, bez3, bez4)) -> rr_curves
+rr_curves %>%
+  mutate(Week = row_number()-1) %>%
+  pivot_longer(cols=-Week, names_to="curve", values_to="values") %>%
+  ggplot(aes(x=Week, y=values, color=curve)) +
+    geom_line(lwd=1) +
+    labs(y="Relative rates of infection") +
+    theme_minimal() +
+    theme(legend.position="none") +
+    scale_color_brewer(type="qual", palette = 2)
+```
+
+## Other assumptions
+
+We are assuming a baseline vaccine efficacy in those fully vaccinated of `r params$ve`, and assume that those who receive a single dose have reduced protection (base case assumes a value of `r params$rel_protect_1_dose` x the efficacy with 2 doses of vaccine). After the first dose is received, it is assumed to take `r params$delay` weeks until the development of protection. There is a minimum `r params$dose_gap` week between receipt of first and second doses. Once a person receives the second dose, protection is assumed to increase to `r params$ve`.   Protection is assumed to wane (base case value of weekly waning factor of `r params$waning_scalar`) in those who do not receive their scheduled second dose, with amount of protection calculated at any given point in time as baseline protection with 1 dose * waning factor^(number of weeks past due for second dose). We assume that all people who receive two doses have the same level of protection, regardless of the delays in receiving the second dose.  
+
+## Scenarios
+
+### Scenario 1: Stable vaccine supply
+
+Compare the current recommendation (fixed, set aside 50% of doses for 2nd dose) to a `r params$switch_week -1 `-week period of administering 1st doses in as many people as possible (reserving 10% of doses), which then switches to a 10% 1st dose / 90% 2nd dose scheme for a `r params$switch_week -1 `-week period, with the remainder of the time reverting back to 50:50 allocation of doses (flexible).
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 1
+params <- params_default
+df <- data.frame()
+df1 <- data.frame()
+
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+
+pct_averted_plot_fun(tmp1)
+  
+
+d1<-cum_benefit_fun(tmp1) 
+d2<-delay_fun(tmp1, d1) 
+
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+df <- bind_rows(df, d2)
+
+d3<- pct_averted_fun(tmp1)
+df1 <- bind_rows(df1, d3)
+
+```
+
+### Scenario 2: Interrupted vaccine supply - moderate reduction
+
+Next we can at the effect of a disrupted vaccine supply on week 4 (with vaccine supply reduced by a factor of 2 from initial levels and remaining at this reduced level for the duration of the simulation).
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 2
+params <- params_default
+reduction <- 2
+
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+
+pct_averted_plot_fun(tmp1)
+
+d1<-cum_benefit_fun(tmp1) 
+
+d2<-delay_fun(tmp1, d1) 
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+df <- bind_rows(df, d2)
+
+d3<- pct_averted_fun(tmp1)
+df1 <- bind_rows(df1, d3)
+```
+
+
+### Scenario 3: Interrupted vaccine supply - large disruption
+
+Next we can at the effect of a disrupted vaccine supply on week 4 (with vaccine supply reduced by a factor of 10 from initial levels and remaining at this reduced level for the duration of the simulation).
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 3
+params <- params_default
+reduction <- 10
+
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1<-cum_benefit_fun(tmp1) 
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+df <- bind_rows(df, d2)
+
+d3<- pct_averted_fun(tmp1)
+df1 <- bind_rows(df1, d3)
+
+```
+
+### Scenario 4: Interrupted vaccine supply and no protection after 6 weeks
+
+Next we can look at the effect of a disrupted vaccine supply on week 4 (with vaccine supply reduced by a factor of 10 from initial levels and remaining at this reduced level for the duration of the simulation) and protection drops to 0 if time to receipt of 2nd dose passes 6 weeks.
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 4
+params <- params_default
+reduction <- 10
+
+
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_drop_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun_drop(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+df <- bind_rows(df, d2)
+
+  
+d3<- pct_averted_fun(tmp1)
+df1 <- bind_rows(df1, d3)
+
+```
+
+### Summary of results 
+
+```{r, echo=FALSE, warning=FALSE, fig.width=8, fig.height=4}
+df %>%
+   filter(`Allocation scheme`=="Flexible") %>%
+   mutate(Scenario = factor(Scenario, levels=seq(1:4), labels=c("Stable supply", "Moderate reduction", "Large reduction", 
+                                                                "Large reduction + no protection after\n6 weeks without second dose"))) %>%
+   ggplot(aes(x=`Incidence trend`, y=`% averted (flexible compared to fixed)`, fill=as.factor(Scenario))) +
+      geom_bar(stat="identity", position="dodge") +
+      geom_hline(yintercept=0, lty=2, color="grey50") +
+      theme_classic() +
+      theme(text = element_text(size=14)) +
+      scale_fill_brewer(type="seq", palette = 1) +
+      labs(x="\nIncidence trend", y="% of cumulative infections averted\nusing the flexible strategy", fill="Scenario") -> p
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.width=8, fig.height=4}
+df %>%
+   rename(scheme = "Allocation scheme", 
+          trend = "Incidence trend", 
+          pct_averted = "% averted (flexible compared to fixed)", 
+          n_any_dose ="# receiving at least one dose (millions)",
+          n_need_second = "# eligible to receive second dose (millions)", 
+          n_receive_second = "# receiving second dose (millions)", 
+          n_on_time_second = "# receiving second dose on week 3 (millions)", 
+          n_effective_protection = "Total effective vaccine protection (millions)") %>%
+   filter(trend=="Stable") %>%
+   select(scheme, Scenario, trend, n_any_dose, n_need_second, n_receive_second, n_on_time_second, n_effective_protection) %>%
+   pivot_longer(cols=-c(scheme, trend, Scenario), names_to="metric", values_to="value") %>%
+   mutate(metric = factor(metric, levels = c("n_effective_protection", "n_on_time_second", "n_receive_second","n_need_second", "n_any_dose"),
+                          labels=c("Total effective population\nprotection at week 8","Received second dose\n3 weeks after first", "Received second dose",
+                                   "Eligible to receive second dose by week 8", "Received at least one dose" )), 
+          scenario = factor(Scenario, levels=seq(1:4), labels=c("Stable supply", "Moderate reduction", "Large reduction", 
+                                                                "Large reduction + no protection after\n6 weeks without second dose"))) %>%
+   ggplot(aes(x=metric, y=value, fill=scheme)) +
+      geom_bar(stat="identity", position="dodge") +
+      facet_grid(.~scenario) +
+      coord_flip() +
+      theme_classic() +
+      theme(text = element_text(size=14), strip.text = element_text(size=8)) +
+      scale_fill_manual(values=c("grey80","grey30" ), labels=c("Fixed", "Flexible"), guide = guide_legend(reverse = TRUE) ) +
+      labs(x="", y="\nNumber of people (millions)", fill="Strategy") -> p1
+```
+
+
+ 
+```{r, echo=FALSE, warning=FALSE}
+params <- params_default
+allocation_scheme <- c("fixed", "switch")
+inc <- 1
+
+sims <- expand_grid(allocation_scheme, inc) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+
+
+p3<- plot_fun(tmp1)
+
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+df1 %>% 
+   filter(scenario<=2) %>%
+     mutate(scenario = factor(scenario, levels=seq(1:2), labels=c("Stable supply", "Moderate reduction")), 
+            sim_name = factor(allocation_scheme, levels=c("fixed", "switch"), labels=c("Fixed", "Flexible"))) %>%   
+      ggplot(aes(x=week, y=pct_averted, color=as.factor(scenario), lty=sim_name)) +
+      geom_line(size=2) +
+      #facet_wrap(sim_name~.) +
+      theme_classic() +
+      theme(text = element_text(size=14), 
+            legend.justification = "left") +
+      scale_color_brewer(type="seq", palette=1) +
+      labs(x="\nWeek", y="% of weekly incidence\naverted with vaccination\n", color="Scenario", lty="Strategy") -> p4
+```
+
+
+```{r, echo=FALSE, warning=FALSE, fig.width=12, fig.height=10, fig.cap="Vaccine allocation and protection over time for base case scenario with 2 strategies."}
+#Compile figures
+p_comb1 <- p3/p4 + plot_annotation(tag_levels = 'A')  + theme(legend.justification = "left") ; p_comb1
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.width=12, fig.height=10, fig.cap="Model-projected outcomes of alternative vaccine allocation strategies under varying assumptions of vaccine supply, incidence, and vaccine characteristics."}
+
+p_comb <- p1/p + plot_annotation(tag_levels = 'A')  + theme(legend.justification = "left") ; p_comb
+
+#ggsave("F2.png", p_comb, width=15, height=9)
+#ggsave("F1.png", p_comb1, width=10, height=8)
+
+```
+
+## Efficacy sensitivity analyses
+
+### First dose efficacy sensitivity analysis: 90% efficacy
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 1
+
+efficacy <-  0.9
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+
+```
+
+
+### First dose efficacy sensitivity analysis: 80.2% efficacy (Moderna)
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 1
+
+efficacy <-  0.802
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+
+### First dose efficacy sensitivity analysis: 70% efficacy 
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 1
+
+efficacy <-  0.7
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+### First dose efficacy sensitivity analysis: 60% efficacy 
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 1
+
+efficacy <-  0.6
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+### First dose efficacy sensitivity analysis: 40% efficacy
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 1
+
+efficacy <-  0.4
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+  
+d3<- pct_averted_fun(tmp1)
+
+
+```
+### First dose efficacy sensitivity analysis: 0% efficacy
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 1
+
+efficacy <-  0
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+  
+d3<- pct_averted_fun(tmp1)
+
+
+```
+
+### First dose efficacy sensitivity analysis: 90% efficacy + large supply disruption
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 10
+
+efficacy <-  0.9
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+
+```
+
+
+### First dose efficacy sensitivity analysis: 80.2% efficacy (Moderna) + large supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 10
+
+efficacy <-  0.802
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+
+### First dose efficacy sensitivity analysis: 70% efficacy + large supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 10
+
+efficacy <-  0.7
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+### First dose efficacy sensitivity analysis: 60% efficacy  + large supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 10
+
+efficacy <-  0.6
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+### First dose efficacy sensitivity analysis: 40% efficacy + large supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 10
+
+efficacy <-  0.4
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+  
+d3<- pct_averted_fun(tmp1)
+
+
+```
+
+### First dose efficacy sensitivity analysis: 30% efficacy + large supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 10
+
+efficacy <-  0.3
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+
+  
+d3<- pct_averted_fun(tmp1)
+
+
+```
+
+### First dose efficacy sensitivity analysis: 20% efficacy + large supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 10
+
+efficacy <-  0.2
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+  
+d3<- pct_averted_fun(tmp1)
+
+```
+
+### First dose efficacy sensitivity analysis: 0% efficacy + large supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 10
+
+efficacy <-  0
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+  
+d3<- pct_averted_fun(tmp1)
+
+```
+
+
+### First dose efficacy sensitivity analysis: 90% efficacy + moderate supply disruption
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 2
+
+efficacy <-  0.9
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+
+```
+
+
+### First dose efficacy sensitivity analysis: 80.2% efficacy (Moderna) + moderate supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 2
+
+efficacy <-  0.802
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+
+### First dose efficacy sensitivity analysis: 70% efficacy + moderate supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 2
+
+efficacy <-  0.7
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+### First dose efficacy sensitivity analysis: 60% efficacy + moderate supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 2
+
+efficacy <-  0.6
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+d3<- pct_averted_fun(tmp1)
+
+```
+
+### First dose efficacy sensitivity analysis: 40% efficacy + moderate supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <-2
+
+efficacy <-  0.4
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+  
+d3<- pct_averted_fun(tmp1)
+
+
+```
+
+### First dose efficacy sensitivity analysis: 30% efficacy + moderate supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 2
+
+efficacy <-  0.3
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+
+
+  
+d3<- pct_averted_fun(tmp1)
+
+
+```
+
+### First dose efficacy sensitivity analysis: 20% efficacy + moderate supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 2
+
+efficacy <-  0.2
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+  
+d3<- pct_averted_fun(tmp1)
+
+```
+
+### First dose efficacy sensitivity analysis: 0% efficacy + moderate supply reduction
+
+```{r, echo=FALSE, warning=FALSE}
+scenario <- 5
+params <- params_default
+reduction <- 2
+
+efficacy <-  0
+allocation_scheme <- c("fixed", "switch")
+max_doses_in <- c(0.02)
+inc <- seq(1:3)
+
+sims <- expand_grid(allocation_scheme, max_doses_in, inc, efficacy) %>%
+        mutate(sim = row_number())
+tmp1 <- data.frame()
+for(kk in 1:nrow(sims)){
+         params$rel_protect_1_dose = sims$efficacy[kk]/params$ve
+         params$start_weekly_doses <- sims$max_doses_in[kk] # max proportion of pop to be vaccinated weekly at start
+         params$end_weekly_doses <- sims$max_doses_in[kk]/reduction # max proportion of pop to be vaccinated weekly by end
+         params$scheme <- sims$allocation_scheme[kk]
+         params$rr_curve_num <- sims$inc[kk]
+         tmp <- vac_fun(params)
+         tmp$sim <- kk
+         tmp1 <- rbind(tmp1, tmp)
+}
+  
+pct_averted_plot_fun(tmp1)
+
+d1 <- cum_benefit_fun(tmp1) # use different function calculate benefit when protection stops after week 6
+
+d2<-delay_fun(tmp1, d1) 
+
+knitr::kable(d2, format="latex", booktabs=TRUE) %>%
+kable_styling(latex_options = "scale_down") %>%
+   column_spec(4:9, width = "2cm")
+
+  
+d3<- pct_averted_fun(tmp1)
+
+```
